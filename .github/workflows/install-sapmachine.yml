@@ -1,0 +1,104 @@
+name: Install SapMachine (MSI) and verify
+
+# Takes a SapMachine .msi download URL, installs the JDK on a Windows runner,
+# and prints `java --version`.
+#
+# Example URL:
+#   https://github.com/SAP/SapMachine/releases/download/sapmachine-25.0.5.1/sapmachine-jdk-25.0.5.1_windows-x64_bin.msi
+
+on:
+  workflow_dispatch:
+    inputs:
+      msi_url:
+        description: "URL of the SapMachine Windows .msi to download and install"
+        required: true
+        type: string
+
+jobs:
+  install-and-verify:
+    runs-on: windows-latest
+
+    steps:
+      - name: Validate input URL
+        shell: pwsh
+        run: |
+          $url = "${{ inputs.msi_url }}"
+          Write-Host "Requested URL: $url"
+          if ($url -notmatch '^https://') {
+            throw "URL must start with https://"
+          }
+          if ($url -notmatch '\.msi$') {
+            throw "URL must point to a .msi file"
+          }
+
+      - name: Download MSI
+        shell: pwsh
+        run: |
+          $url = "${{ inputs.msi_url }}"
+          $dest = Join-Path $env:RUNNER_TEMP "sapmachine.msi"
+          Write-Host "Downloading $url -> $dest"
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          $size = (Get-Item $dest).Length
+          Write-Host "Downloaded $size bytes"
+          if ($size -lt 1MB) {
+            throw "Downloaded file is suspiciously small ($size bytes); aborting."
+          }
+          "MSI_PATH=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install MSI (silent)
+        shell: pwsh
+        run: |
+          $msi = $env:MSI_PATH
+          $log = Join-Path $env:RUNNER_TEMP "sapmachine-install.log"
+          Write-Host "Installing $msi"
+          $p = Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart", "/l*v", "`"$log`"" `
+            -Wait -PassThru
+          Write-Host "msiexec exit code: $($p.ExitCode)"
+          if (Test-Path $log) {
+            Write-Host "----- install log (tail) -----"
+            Get-Content $log -Tail 40
+          }
+          # 0 = success, 3010 = success but reboot required
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "MSI installation failed with exit code $($p.ExitCode)"
+          }
+
+      - name: Locate java.exe
+        shell: pwsh
+        run: |
+          $roots = @(
+            "C:\Program Files\SapMachine",
+            "C:\Program Files",
+            "C:\Program Files (x86)"
+          )
+          $java = $null
+          foreach ($root in $roots) {
+            if (Test-Path $root) {
+              $java = Get-ChildItem -Path $root -Recurse -Filter "java.exe" -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -match "sapmachine" } |
+                      Select-Object -First 1
+              if ($java) { break }
+            }
+          }
+          if (-not $java) {
+            throw "Could not find a SapMachine java.exe after installation."
+          }
+          $binDir = Split-Path $java.FullName
+          $javaHome = Split-Path $binDir
+          Write-Host "Found java.exe at: $($java.FullName)"
+          Write-Host "JAVA_HOME: $javaHome"
+          "JAVA_HOME=$javaHome" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $binDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Print java --version
+        shell: pwsh
+        run: |
+          Write-Host "JAVA_HOME = $env:JAVA_HOME"
+          java --version
+          Write-Host ""
+          Write-Host "----- Summary -----"
+          "### SapMachine installed" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          java --version 2>&1 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
